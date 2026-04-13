@@ -15,14 +15,18 @@ module.exports = (pool) => {
         });
     });
 
-    // 2. Create New Ticket
+    // 2. Create New Ticket (WITH SANITIZATION)
     router.post('/create', (req, res) => {
         const { title, category, priority, pc_number, assigned_to } = req.body;
+        
+        // CLEANUP: Ensure pc_number has no hidden spaces or newlines before saving
+        const cleanPcNumber = pc_number ? pc_number.toString().trim() : '';
+
         const sql = `
             INSERT INTO tickets (title, category, priority, pc_number, assigned_to, status) 
             VALUES (?, ?, ?, ?, ?, 'Open')
         `;
-        pool.query(sql, [title, category, priority, pc_number, assigned_to], (err, result) => {
+        pool.query(sql, [title, category, priority, cleanPcNumber, assigned_to], (err, result) => {
             if (err) {
                 console.error("❌ Insert Error:", err);
                 return res.status(500).json({ error: err.message });
@@ -32,7 +36,6 @@ module.exports = (pool) => {
     });
 
     // 3. Resolve Ticket 
-    // Captures the IT member's name (resolver) to track individual performance
     router.put('/resolve/:id', (req, res) => {
         const { id } = req.params;
         const { resolver } = req.body; 
@@ -43,18 +46,12 @@ module.exports = (pool) => {
                 console.error("❌ Resolve Error:", err);
                 return res.status(500).json({ error: "DB Update Failed" });
             }
-            res.json({ 
-                success: true, 
-                message: `Ticket #${id} resolved and assigned to ${resolver}` 
-            });
+            res.json({ success: true, message: `Ticket #${id} resolved by ${resolver}` });
         });
     });
 
     // 4. Get Analytics for Report Page
-    // Tracks System Totals, Staff Productivity, and PC-specific issues
     router.get('/analytics', (req, res) => {
-        
-        // Overview Stats
         const statsSql = `
             SELECT 
                 COUNT(*) as total,
@@ -63,7 +60,6 @@ module.exports = (pool) => {
             FROM tickets;
         `;
         
-        // Individual Performance: Tickets resolved by each IT staff member
         const perPersonSql = `
             SELECT assigned_to as name, COUNT(*) as count 
             FROM tickets 
@@ -72,32 +68,42 @@ module.exports = (pool) => {
             ORDER BY count DESC;
         `;
 
-        // PC Frequency: Tracks how many times a specific PC appears in the incident logs
-        const perPcSql = `
-            SELECT pc_number, COUNT(*) as count 
-            FROM tickets 
-            WHERE pc_number IS NOT NULL AND pc_number != ''
-            GROUP BY pc_number
-            ORDER BY count DESC
-            LIMIT 10;
-        `;
-
         pool.query(statsSql, (err, overview) => {
             if (err) return res.status(500).json({ error: err.message });
-            
             pool.query(perPersonSql, (err, personStats) => {
                 if (err) return res.status(500).json({ error: err.message });
-                
-                pool.query(perPcSql, (err, pcStats) => {
-                    if (err) return res.status(500).json({ error: err.message });
-                    
-                    res.json({
-                        overview: overview[0],
-                        byPerson: personStats,
-                        byPc: pcStats
-                    });
+                res.json({
+                    overview: overview[0],
+                    byPerson: personStats
                 });
             });
+        });
+    });
+
+    // 5. Audit History (FIXED FOR HIDDEN WHITESPACE)
+    // Uses LIKE %...% to find the PC number even if it contains newlines or spaces
+    router.get('/pc-history/:pcNumber', (req, res) => {
+        const { pcNumber } = req.params;
+        
+        // We use LIKE and wrap the search term in wildcards to bypass formatting issues
+        const sql = `
+            SELECT 
+                created_at, 
+                category as issue_type, 
+                title, 
+                assigned_to, 
+                status 
+            FROM tickets 
+            WHERE pc_number LIKE ? 
+            ORDER BY created_at DESC
+        `;
+
+        pool.query(sql, [`%${pcNumber}%`], (err, results) => {
+            if (err) {
+                console.error("❌ PC History Error:", err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json(results);
         });
     });
 
