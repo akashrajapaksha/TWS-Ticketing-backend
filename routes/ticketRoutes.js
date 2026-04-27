@@ -1,8 +1,43 @@
 const express = require('express');
 const router = express.Router();
+const axios = require('axios'); // Added axios for Telegram
 
 module.exports = (pool) => {
-    
+
+    // HELPER: Send Telegram Message
+    const sendTelegramAlert = async (ticketData) => {
+        const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+        const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+        if (!BOT_TOKEN || !CHAT_ID) {
+            console.warn("⚠️ Telegram credentials missing in .env file");
+            return;
+        }
+
+        const message = `
+🚨 *New HelpDesk Ticket*
+--------------------------
+📌 *Title:* ${ticketData.title}
+📂 *Category:* ${ticketData.category}
+⚡ *Priority:* ${ticketData.priority}
+💻 *PC Number:* ${ticketData.pc_number}
+👤 *Assigned:* ${ticketData.assigned_to}
+--------------------------
+_Check the dashboard to resolve._
+        `;
+
+        try {
+            await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                chat_id: CHAT_ID,
+                text: message,
+                parse_mode: 'Markdown'
+            });
+            console.log("✅ Telegram notification sent!");
+        } catch (error) {
+            console.error("❌ Telegram Error:", error.response?.data || error.message);
+        }
+    };
+
     // 1. Get All Tickets (Standard Queue)
     router.get('/all', (req, res) => {
         const sql = "SELECT * FROM tickets ORDER BY id DESC";
@@ -15,22 +50,26 @@ module.exports = (pool) => {
         });
     });
 
-    // 2. Create New Ticket (WITH SANITIZATION)
+    // 2. Create New Ticket (WITH TELEGRAM NOTIFICATION)
     router.post('/create', (req, res) => {
         const { title, category, priority, pc_number, assigned_to } = req.body;
         
-        // CLEANUP: Ensure pc_number has no hidden spaces or newlines before saving
         const cleanPcNumber = pc_number ? pc_number.toString().trim() : '';
 
         const sql = `
             INSERT INTO tickets (title, category, priority, pc_number, assigned_to, status) 
             VALUES (?, ?, ?, ?, ?, 'Open')
         `;
+
         pool.query(sql, [title, category, priority, cleanPcNumber, assigned_to], (err, result) => {
             if (err) {
                 console.error("❌ Insert Error:", err);
                 return res.status(500).json({ error: err.message });
             }
+
+            // TRIGGER TELEGRAM ALERT
+            sendTelegramAlert({ title, category, priority, pc_number: cleanPcNumber, assigned_to });
+
             res.status(201).json({ success: true, id: result.insertId });
         });
     });
@@ -80,19 +119,11 @@ module.exports = (pool) => {
         });
     });
 
-    // 5. Audit History (FIXED FOR HIDDEN WHITESPACE)
-    // Uses LIKE %...% to find the PC number even if it contains newlines or spaces
+    // 5. Audit History
     router.get('/pc-history/:pcNumber', (req, res) => {
         const { pcNumber } = req.params;
-        
-        // We use LIKE and wrap the search term in wildcards to bypass formatting issues
         const sql = `
-            SELECT 
-                created_at, 
-                category as issue_type, 
-                title, 
-                assigned_to, 
-                status 
+            SELECT created_at, category as issue_type, title, assigned_to, status 
             FROM tickets 
             WHERE pc_number LIKE ? 
             ORDER BY created_at DESC
