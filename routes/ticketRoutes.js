@@ -1,10 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const axios = require('axios'); // Added axios for Telegram
+const axios = require('axios');
 
 module.exports = (pool) => {
 
-    // HELPER: Send Telegram Message
+    /**
+     * HELPER: Send Telegram Message
+     */
     const sendTelegramAlert = async (ticketData) => {
         const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
         const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -15,15 +17,16 @@ module.exports = (pool) => {
         }
 
         const message = `
-🚨 *New HelpDesk Ticket*
---------------------------
+🚨 *NEW HELPDESK TICKET* 🚨
+------------------------------------
 📌 *Title:* ${ticketData.title}
 📂 *Category:* ${ticketData.category}
 ⚡ *Priority:* ${ticketData.priority}
 💻 *PC Number:* ${ticketData.pc_number}
 👤 *Assigned:* ${ticketData.assigned_to}
---------------------------
-_Check the dashboard to resolve._
+------------------------------------
+🕒 ${new Date().toLocaleString('en-US', { hour12: true })}
+_Action Required: Visit the Dashboard to update status._
         `;
 
         try {
@@ -32,29 +35,25 @@ _Check the dashboard to resolve._
                 text: message,
                 parse_mode: 'Markdown'
             });
-            console.log("✅ Telegram notification sent!");
+            console.log("✅ Telegram alert posted to channel!");
         } catch (error) {
-            console.error("❌ Telegram Error:", error.response?.data || error.message);
+            console.error("❌ Telegram API Error:", error.response?.data || error.message);
         }
     };
 
-    // 1. Get All Tickets (Standard Queue)
+    // 1. GET ALL TICKETS
     router.get('/all', (req, res) => {
         const sql = "SELECT * FROM tickets ORDER BY id DESC";
         pool.query(sql, (err, results) => {
-            if (err) {
-                console.error("❌ Fetch Error:", err);
-                return res.status(500).json({ error: err.message });
-            }
+            if (err) return res.status(500).json({ error: "Failed to load tickets" });
             res.json(results);
         });
     });
 
-    // 2. Create New Ticket (WITH TELEGRAM NOTIFICATION)
+    // 2. CREATE NEW TICKET
     router.post('/create', (req, res) => {
         const { title, category, priority, pc_number, assigned_to } = req.body;
-        
-        const cleanPcNumber = pc_number ? pc_number.toString().trim() : '';
+        const cleanPcNumber = pc_number ? pc_number.toString().trim() : 'N/A';
 
         const sql = `
             INSERT INTO tickets (title, category, priority, pc_number, assigned_to, status) 
@@ -62,34 +61,33 @@ _Check the dashboard to resolve._
         `;
 
         pool.query(sql, [title, category, priority, cleanPcNumber, assigned_to], (err, result) => {
-            if (err) {
-                console.error("❌ Insert Error:", err);
-                return res.status(500).json({ error: err.message });
-            }
+            if (err) return res.status(500).json({ error: "Failed to create ticket" });
 
-            // TRIGGER TELEGRAM ALERT
-            sendTelegramAlert({ title, category, priority, pc_number: cleanPcNumber, assigned_to });
+            sendTelegramAlert({ 
+                title, category, priority, 
+                pc_number: cleanPcNumber, assigned_to 
+            });
 
-            res.status(201).json({ success: true, id: result.insertId });
+            res.status(201).json({ 
+                success: true, 
+                id: result.insertId 
+            });
         });
     });
 
-    // 3. Resolve Ticket 
+    // 3. RESOLVE TICKET
     router.put('/resolve/:id', (req, res) => {
         const { id } = req.params;
         const { resolver } = req.body; 
         const sql = "UPDATE tickets SET status = 'Resolved', assigned_to = ? WHERE id = ?";
         
         pool.query(sql, [resolver, id], (err, result) => {
-            if (err) {
-                console.error("❌ Resolve Error:", err);
-                return res.status(500).json({ error: "DB Update Failed" });
-            }
-            res.json({ success: true, message: `Ticket #${id} resolved by ${resolver}` });
+            if (err) return res.status(500).json({ error: "Database update failed" });
+            res.json({ success: true, message: `Ticket #${id} resolved` });
         });
     });
 
-    // 4. Get Analytics for Report Page
+    // 4. ANALYTICS (Overview, Person, and PC stats)
     router.get('/analytics', (req, res) => {
         const statsSql = `
             SELECT 
@@ -107,19 +105,35 @@ _Check the dashboard to resolve._
             ORDER BY count DESC;
         `;
 
+        const perPcSql = `
+            SELECT pc_number, COUNT(*) as count 
+            FROM tickets 
+            WHERE pc_number IS NOT NULL AND pc_number != ''
+            GROUP BY pc_number
+            ORDER BY count DESC
+            LIMIT 10;
+        `;
+
         pool.query(statsSql, (err, overview) => {
             if (err) return res.status(500).json({ error: err.message });
+            
             pool.query(perPersonSql, (err, personStats) => {
                 if (err) return res.status(500).json({ error: err.message });
-                res.json({
-                    overview: overview[0],
-                    byPerson: personStats
+
+                pool.query(perPcSql, (err, pcStats) => {
+                    if (err) return res.status(500).json({ error: err.message });
+                    
+                    res.json({
+                        overview: overview[0],
+                        byPerson: personStats,
+                        byPc: pcStats
+                    });
                 });
             });
         });
     });
 
-    // 5. Audit History
+    // 5. PC AUDIT HISTORY
     router.get('/pc-history/:pcNumber', (req, res) => {
         const { pcNumber } = req.params;
         const sql = `
@@ -130,13 +144,32 @@ _Check the dashboard to resolve._
         `;
 
         pool.query(sql, [`%${pcNumber}%`], (err, results) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json(results);
+        });
+    });
+
+    // 6. STAFF RESOLUTION HISTORY
+    // Fixed: Moved inside the module.exports block
+    router.get('/staff-history/:staffName', (req, res) => {
+        const { staffName } = req.params;
+        
+        const sql = `
+            SELECT id, created_at, category, title, pc_number, status 
+            FROM tickets 
+            WHERE LOWER(assigned_to) = LOWER(?) AND status = 'Resolved'
+            ORDER BY created_at DESC
+        `;
+
+        pool.query(sql, [staffName], (err, results) => {
             if (err) {
-                console.error("❌ PC History Error:", err);
-                return res.status(500).json({ error: err.message });
+                console.error("Database error:", err);
+                return res.status(500).json({ error: "Database query failed" });
             }
             res.json(results);
         });
     });
 
+    // CRITICAL: Return the router at the end of the function
     return router;
 };
