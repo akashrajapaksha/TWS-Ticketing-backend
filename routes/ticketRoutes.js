@@ -41,7 +41,7 @@ _Action Required: Visit the Dashboard to update status._
         }
     };
 
-    // 1. GET ALL TICKETS
+    // 1. GET ALL TICKETS (Excludes fully resolved ones if needed, or returns all for the frontend to filter)
     router.get('/all', (req, res) => {
         const sql = "SELECT * FROM tickets ORDER BY id DESC";
         pool.query(sql, (err, results) => {
@@ -75,19 +75,48 @@ _Action Required: Visit the Dashboard to update status._
         });
     });
 
-    // 3. RESOLVE TICKET
-    router.put('/resolve/:id', (req, res) => {
-        const { id } = req.params;
-        const { resolver } = req.body; 
-        const sql = "UPDATE tickets SET status = 'Resolved', assigned_to = ? WHERE id = ?";
-        
-        pool.query(sql, [resolver, id], (err, result) => {
-            if (err) return res.status(500).json({ error: "Database update failed" });
-            res.json({ success: true, message: `Ticket #${id} resolved` });
-        });
-    });
+    // 3. RESOLVE / UPDATE TICKET STATUS
+router.put('/resolve/:id', (req, res) => {
+    const { id } = req.params;
+    // Frontend sends status, resolver, and role
+    const { status, resolver, role } = req.body;
 
-    // 4. ANALYTICS (Overview, Person, and PC stats)
+    if (!status || !resolver) {
+        return res.status(400).json({ 
+            success: false, 
+            message: "Status and Resolver name are required" 
+        });
+    }
+
+    const sql = `
+        UPDATE tickets 
+        SET 
+            status = ?, 
+            resolved_by = ?, 
+            resolved_at = CURRENT_TIMESTAMP 
+        WHERE id = ?
+    `;
+
+    // Crucial: Use pool.query and pass the parameters in an array
+    pool.query(sql, [status, resolver, id], (err, result) => {
+        if (err) {
+            console.error("❌ Database Error during resolve:", err);
+            return res.status(500).json({ error: "Failed to update ticket status in database" });
+        }
+
+        if (result.affectedRows > 0) {
+            console.log(`✅ Ticket #${id} updated to: ${status}`);
+            res.json({ 
+                success: true, 
+                message: `Ticket updated to ${status} by ${role || 'User'}` 
+            });
+        } else {
+            res.status(404).json({ success: false, message: "Ticket not found" });
+        }
+    });
+});
+
+    // 4. ANALYTICS
     router.get('/analytics', (req, res) => {
         const statsSql = `
             SELECT 
@@ -150,7 +179,6 @@ _Action Required: Visit the Dashboard to update status._
     });
 
     // 6. STAFF RESOLUTION HISTORY
-    // Fixed: Moved inside the module.exports block
     router.get('/staff-history/:staffName', (req, res) => {
         const { staffName } = req.params;
         
@@ -170,6 +198,5 @@ _Action Required: Visit the Dashboard to update status._
         });
     });
 
-    // CRITICAL: Return the router at the end of the function
     return router;
 };
