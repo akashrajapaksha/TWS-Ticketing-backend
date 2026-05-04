@@ -41,7 +41,7 @@ _Action Required: Visit the Dashboard to update status._
         }
     };
 
-    // 1. GET ALL TICKETS (Excludes fully resolved ones if needed, or returns all for the frontend to filter)
+    // 1. GET ALL TICKETS
     router.get('/all', (req, res) => {
         const sql = "SELECT * FROM tickets ORDER BY id DESC";
         pool.query(sql, (err, results) => {
@@ -60,64 +60,66 @@ _Action Required: Visit the Dashboard to update status._
             VALUES (?, ?, ?, ?, ?, 'Open')
         `;
 
-        pool.query(sql, [title, category, priority, cleanPcNumber, assigned_to], (err, result) => {
-            if (err) return res.status(500).json({ error: "Failed to create ticket" });
+        const finalPriority = priority || 'Medium';
+        const finalAssigned = assigned_to || 'Unassigned';
+
+        pool.query(sql, [title, category, finalPriority, cleanPcNumber, finalAssigned], (err, result) => {
+            if (err) {
+                console.error("❌ Insert Error:", err);
+                return res.status(500).json({ error: "Failed to create ticket" });
+            }
 
             sendTelegramAlert({ 
-                title, category, priority, 
-                pc_number: cleanPcNumber, assigned_to 
+                title, category, priority: finalPriority, 
+                pc_number: cleanPcNumber, assigned_to: finalAssigned 
             });
 
-            res.status(201).json({ 
-                success: true, 
-                id: result.insertId 
-            });
+            res.status(201).json({ success: true, id: result.insertId });
         });
     });
 
     // 3. RESOLVE / UPDATE TICKET STATUS
-router.put('/resolve/:id', (req, res) => {
-    const { id } = req.params;
-    // Frontend sends status, resolver, and role
-    const { status, resolver, role } = req.body;
+    router.put('/resolve/:id', (req, res) => {
+        const { id } = req.params;
+        const { status, resolver, role } = req.body;
 
-    if (!status || !resolver) {
-        return res.status(400).json({ 
-            success: false, 
-            message: "Status and Resolver name are required" 
-        });
-    }
-
-    const sql = `
-        UPDATE tickets 
-        SET 
-            status = ?, 
-            resolved_by = ?, 
-            resolved_at = CURRENT_TIMESTAMP 
-        WHERE id = ?
-    `;
-
-    // Crucial: Use pool.query and pass the parameters in an array
-    pool.query(sql, [status, resolver, id], (err, result) => {
-        if (err) {
-            console.error("❌ Database Error during resolve:", err);
-            return res.status(500).json({ error: "Failed to update ticket status in database" });
-        }
-
-        if (result.affectedRows > 0) {
-            console.log(`✅ Ticket #${id} updated to: ${status}`);
-            res.json({ 
-                success: true, 
-                message: `Ticket updated to ${status} by ${role || 'User'}` 
+        if (!status || !resolver) {
+            return res.status(400).json({ 
+                success: false, 
+                message: "Status and Resolver name are required" 
             });
-        } else {
-            res.status(404).json({ success: false, message: "Ticket not found" });
         }
+
+        const sql = `
+            UPDATE tickets 
+            SET 
+                status = ?, 
+                resolved_by = ?, 
+                resolved_at = CASE WHEN ? = 'Resolved' THEN CURRENT_TIMESTAMP ELSE resolved_at END 
+            WHERE id = ?
+        `;
+
+        pool.query(sql, [status, resolver, status, id], (err, result) => {
+            if (err) {
+                console.error("❌ Database Error during resolve:", err);
+                return res.status(500).json({ error: "Failed to update ticket status" });
+            }
+
+            if (result.affectedRows > 0) {
+                res.json({ 
+                    success: true, 
+                    message: `Ticket updated to ${status} by ${role || 'User'}` 
+                });
+            } else {
+                res.status(404).json({ success: false, message: "Ticket not found" });
+            }
+        });
     });
-});
 
     // 4. ANALYTICS
     router.get('/analytics', (req, res) => {
+        const { staffStart, staffEnd, pcStart, pcEnd } = req.query;
+
         const statsSql = `
             SELECT 
                 COUNT(*) as total,
@@ -126,30 +128,37 @@ router.put('/resolve/:id', (req, res) => {
             FROM tickets;
         `;
         
-        const perPersonSql = `
-            SELECT assigned_to as name, COUNT(*) as count 
+        let perPersonSql = `
+            SELECT resolved_by as name, COUNT(*) as count 
             FROM tickets 
-            WHERE status = 'Resolved' AND assigned_to != 'Unassigned'
-            GROUP BY assigned_to
-            ORDER BY count DESC;
+            WHERE status = 'Resolved' AND resolved_by IS NOT NULL AND resolved_by != ''
         `;
+        const staffParams = [];
+        if (staffStart && staffEnd) {
+            perPersonSql += ` AND created_at BETWEEN ? AND ? `;
+            staffParams.push(`${staffStart} 00:00:00`, `${staffEnd} 23:59:59`);
+        }
+        perPersonSql += ` GROUP BY resolved_by ORDER BY count DESC;`;
 
-        const perPcSql = `
+        let perPcSql = `
             SELECT pc_number, COUNT(*) as count 
             FROM tickets 
             WHERE pc_number IS NOT NULL AND pc_number != ''
-            GROUP BY pc_number
-            ORDER BY count DESC
-            LIMIT 10;
         `;
+        const pcParams = [];
+        if (pcStart && pcEnd) {
+            perPcSql += ` AND created_at BETWEEN ? AND ? `;
+            pcParams.push(`${pcStart} 00:00:00`, `${pcEnd} 23:59:59`);
+        }
+        perPcSql += ` GROUP BY pc_number ORDER BY count DESC LIMIT 10;`;
 
         pool.query(statsSql, (err, overview) => {
             if (err) return res.status(500).json({ error: err.message });
             
-            pool.query(perPersonSql, (err, personStats) => {
+            pool.query(perPersonSql, staffParams, (err, personStats) => {
                 if (err) return res.status(500).json({ error: err.message });
 
-                pool.query(perPcSql, (err, pcStats) => {
+                pool.query(perPcSql, pcParams, (err, pcStats) => {
                     if (err) return res.status(500).json({ error: err.message });
                     
                     res.json({
@@ -162,36 +171,53 @@ router.put('/resolve/:id', (req, res) => {
         });
     });
 
-    // 5. PC AUDIT HISTORY
+    // 5. PC AUDIT HISTORY (Updated with Date Filters)
     router.get('/pc-history/:pcNumber', (req, res) => {
         const { pcNumber } = req.params;
-        const sql = `
-            SELECT created_at, category as issue_type, title, assigned_to, status 
-            FROM tickets 
-            WHERE pc_number LIKE ? 
-            ORDER BY created_at DESC
-        `;
+        const { startDate, endDate } = req.query;
 
-        pool.query(sql, [`%${pcNumber}%`], (err, results) => {
+        let sql = `
+            SELECT created_at, category as issue_type, title, resolved_by, assigned_to, status 
+            FROM tickets 
+            WHERE pc_number = ?
+        `;
+        const params = [pcNumber];
+
+        if (startDate && endDate) {
+            sql += ` AND created_at BETWEEN ? AND ? `;
+            params.push(`${startDate} 00:00:00`, `${endDate} 23:59:59`);
+        }
+
+        sql += ` ORDER BY created_at DESC`;
+
+        pool.query(sql, params, (err, results) => {
             if (err) return res.status(500).json({ error: err.message });
             res.json(results);
         });
     });
 
-    // 6. STAFF RESOLUTION HISTORY
+    // 6. STAFF RESOLUTION HISTORY (Updated with Date Filters)
     router.get('/staff-history/:staffName', (req, res) => {
         const { staffName } = req.params;
+        const { startDate, endDate } = req.query;
         
-        const sql = `
+        let sql = `
             SELECT id, created_at, category, title, pc_number, status 
             FROM tickets 
-            WHERE LOWER(assigned_to) = LOWER(?) AND status = 'Resolved'
-            ORDER BY created_at DESC
+            WHERE LOWER(resolved_by) = LOWER(?) AND status = 'Resolved'
         `;
+        const params = [staffName];
 
-        pool.query(sql, [staffName], (err, results) => {
+        if (startDate && endDate) {
+            sql += ` AND created_at BETWEEN ? AND ? `;
+            params.push(`${startDate} 00:00:00`, `${endDate} 23:59:59`);
+        }
+
+        sql += ` ORDER BY created_at DESC`;
+
+        pool.query(sql, params, (err, results) => {
             if (err) {
-                console.error("Database error:", err);
+                console.error("❌ Database error in staff history:", err);
                 return res.status(500).json({ error: "Database query failed" });
             }
             res.json(results);
